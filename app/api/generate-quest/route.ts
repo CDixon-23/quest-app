@@ -6,16 +6,15 @@ import { supabaseAdmin } from "@/lib/supabase";
 import type { OnboardingAnswers } from "@/lib/onboarding-schema";
 import type { QuestTier } from "@/lib/database.types";
 import {
-  QUEST_SYSTEM_PROMPT,
+  buildSystemPrompt,
   buildUserMessage,
   computeExpiresAt,
   XP_RANGE,
 } from "@/lib/quest-prompt";
 
-// ─── Anthropic client (singleton per cold start) ──────────────────────────────
+// ─── Anthropic client ─────────────────────────────────────────────────────────
 
 const anthropic = new Anthropic();
-// ANTHROPIC_API_KEY is read automatically from process.env
 
 // ─── Schemas ─────────────────────────────────────────────────────────────────
 
@@ -23,7 +22,6 @@ const RequestSchema = z.object({
   tier: z.enum(["daily", "weekly", "monthly"]),
 });
 
-// The shape Claude must return — drives the structured-output constraint.
 function buildQuestOutputSchema(tier: QuestTier) {
   const { min, max } = XP_RANGE[tier];
   return z.object({
@@ -57,6 +55,88 @@ function buildQuestOutputSchema(tier: QuestTier) {
 
 type QuestOutput = z.infer<ReturnType<typeof buildQuestOutputSchema>>;
 
+// ─── Hard-nos post-generation check ──────────────────────────────────────────
+
+/**
+ * Returns true if any hard-no keyword appears in the generated quest text.
+ * Ignores keywords shorter than 3 characters to avoid false positives.
+ */
+function containsHardNos(output: QuestOutput, hardNos: string): boolean {
+  if (!hardNos.trim()) return false;
+
+  const keywords = hardNos
+    .split(/[,;]+/)
+    .map((k) => k.trim().toLowerCase())
+    .filter((k) => k.length >= 3);
+
+  const questText = [
+    output.title,
+    output.description,
+    output.flavor_text,
+    output.success_criteria,
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  return keywords.some((kw) => questText.includes(kw));
+}
+
+// ─── Generation with retry ───────────────────────────────────────────────────
+
+async function generateWithRetry(
+  tier:         QuestTier,
+  answers:      OnboardingAnswers,
+  recentTitles: string[],
+): Promise<{ output: QuestOutput; regenerated: boolean; hardNosTriggered: boolean }> {
+  const hardNos = answers.hardNos ?? "";
+  let regenerated       = false;
+  let hardNosTriggered  = false;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const isRetry = attempt > 0;
+
+    let message;
+    try {
+      message = await anthropic.messages.parse({
+        model:      "claude-sonnet-4-6",
+        max_tokens: isRetry ? 1536 : 1024,
+        system:     buildSystemPrompt(hardNos, isRetry),
+        output_config: {
+          format: zodOutputFormat(buildQuestOutputSchema(tier)),
+        },
+        messages: [
+          {
+            role:    "user",
+            content: buildUserMessage(tier, answers, recentTitles),
+          },
+        ],
+      });
+    } catch (err) {
+      if (err instanceof Anthropic.RateLimitError) throw err; // surface immediately
+      if (attempt === 0) { regenerated = true; continue; }
+      throw err;
+    }
+
+    if (!message.parsed_output) {
+      if (attempt === 0) { regenerated = true; continue; }
+      throw new Error("Claude returned no parsed output after retry.");
+    }
+
+    const output = message.parsed_output;
+
+    // Post-generation hard-nos keyword check
+    if (hardNos && containsHardNos(output, hardNos) && attempt === 0) {
+      hardNosTriggered = true;
+      regenerated      = true;
+      continue; // try again with stricter system prompt
+    }
+
+    return { output, regenerated, hardNosTriggered: hardNosTriggered && !isRetry };
+  }
+
+  throw new Error("Quest generation failed after retry.");
+}
+
 // ─── Route handler ────────────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
@@ -77,9 +157,9 @@ export async function POST(req: NextRequest) {
   }
   const { tier } = parsed.data;
 
-  // 2. Authenticate — caller must pass the Supabase JWT as a Bearer token
+  // 2. Auth
   const authHeader = req.headers.get("authorization");
-  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  const token      = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
   if (!token) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
@@ -93,81 +173,107 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
 
-  // 3. Fetch the user's onboarding answers
-  const { data: profile, error: profileError } = await supabaseAdmin
-    .from("profiles")
-    .select("onboarding_answers")
+  // 3. Rate limit: at most one call per tier per 5 seconds
+  const fiveSecsAgo = new Date(Date.now() - 5_000).toISOString();
+  const { data: recentLog } = await supabaseAdmin
+    .from("quest_generation_log")
+    .select("id")
     .eq("user_id", user.id)
-    .single();
+    .eq("tier", tier)
+    .gte("created_at", fiveSecsAgo)
+    .limit(1)
+    .maybeSingle();
 
-  if (profileError) {
-    console.error("[generate-quest] profile fetch error", profileError);
+  if (recentLog) {
+    return NextResponse.json(
+      { error: "The forge needs a moment — try again shortly." },
+      { status: 429 }
+    );
+  }
+
+  // 4. Fetch profile (answers + timezone) and last 10 quest titles in parallel
+  const [profileRes, recentQuestsRes] = await Promise.all([
+    supabaseAdmin
+      .from("profiles")
+      .select("onboarding_answers, timezone")
+      .eq("user_id", user.id)
+      .single(),
+    supabaseAdmin
+      .from("quests")
+      .select("title")
+      .eq("user_id", user.id)
+      .eq("tier", tier)
+      .order("generated_at", { ascending: false })
+      .limit(10),
+  ]);
+
+  if (profileRes.error) {
+    console.error("[generate-quest] profile fetch error", profileRes.error);
     return NextResponse.json({ error: "Could not load your profile." }, { status: 500 });
   }
 
-  if (!profile?.onboarding_answers || Object.keys(profile.onboarding_answers).length === 0) {
+  if (!profileRes.data?.onboarding_answers || Object.keys(profileRes.data.onboarding_answers).length === 0) {
     return NextResponse.json(
       { error: "Complete onboarding before generating quests." },
       { status: 422 }
     );
   }
 
-  const answers = profile.onboarding_answers as unknown as OnboardingAnswers;
+  const answers      = profileRes.data.onboarding_answers as unknown as OnboardingAnswers;
+  const timezone     = profileRes.data.timezone ?? "UTC";
+  const recentTitles = (recentQuestsRes.data ?? []).map((q) => q.title);
 
-  // 4. Generate the quest with Claude Sonnet
+  // 5. Generate with retry
+  const systemPromptForLog = buildSystemPrompt(answers.hardNos);
+  const userMessageForLog  = buildUserMessage(tier, answers, recentTitles);
+
   let questOutput: QuestOutput;
+  let regenerated       = false;
+  let hardNosTriggered  = false;
+  let generationError: string | null = null;
+
   try {
-    const message = await anthropic.messages.parse({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1024,
-      system: QUEST_SYSTEM_PROMPT,
-      output_config: {
-        format: zodOutputFormat(buildQuestOutputSchema(tier)),
-      },
-      messages: [
-        {
-          role: "user",
-          content: buildUserMessage(tier, answers),
-        },
-      ],
-    });
-
-    if (!message.parsed_output) {
-      console.error("[generate-quest] Claude returned no parsed output", message.content);
-      return NextResponse.json({ error: "Quest generation failed — no output." }, { status: 502 });
-    }
-
-    questOutput = message.parsed_output;
+    const result = await generateWithRetry(tier, answers, recentTitles);
+    questOutput      = result.output;
+    regenerated      = result.regenerated;
+    hardNosTriggered = result.hardNosTriggered;
   } catch (err) {
     if (err instanceof Anthropic.RateLimitError) {
+      generationError = "rate_limited";
+      void logGeneration(user.id, tier, systemPromptForLog, userMessageForLog, null, false, false, "Rate limited");
       return NextResponse.json(
         { error: "The quest forge is busy — try again in a moment." },
         { status: 429 }
       );
     }
     if (err instanceof Anthropic.AuthenticationError) {
+      generationError = "auth_error";
       console.error("[generate-quest] Anthropic auth error — check ANTHROPIC_API_KEY");
+      void logGeneration(user.id, tier, systemPromptForLog, userMessageForLog, null, false, false, "Auth error");
       return NextResponse.json({ error: "Quest generation misconfigured." }, { status: 500 });
     }
-    if (err instanceof Anthropic.APIError) {
-      console.error("[generate-quest] Anthropic API error", err.status, err.message);
-      return NextResponse.json({ error: "Quest generation failed." }, { status: 502 });
+    if (err instanceof Error) {
+      generationError = err.message;
     }
-    throw err; // unexpected — let Next.js handle it
+    void logGeneration(user.id, tier, systemPromptForLog, userMessageForLog, null, regenerated, hardNosTriggered, generationError);
+    return NextResponse.json({ error: "Quest generation failed — please try again." }, { status: 502 });
   }
 
-  // 5. Persist the quest to Supabase
+  // 6. Log generation
+  void logGeneration(user.id, tier, systemPromptForLog, userMessageForLog, questOutput, regenerated, hardNosTriggered, null);
+
+  // 7. Persist the quest
   const { data: quest, error: insertError } = await supabaseAdmin
     .from("quests")
     .insert({
-      user_id: user.id,
+      user_id:          user.id,
       tier,
-      flavor_text: questOutput.flavor_text,
-      title: questOutput.title,
-      description: questOutput.description,
+      flavor_text:      questOutput.flavor_text,
+      title:            questOutput.title,
+      description:      questOutput.description,
       success_criteria: questOutput.success_criteria,
-      reward_xp: questOutput.reward_xp,
-      expires_at: computeExpiresAt(tier).toISOString(),
+      reward_xp:        questOutput.reward_xp,
+      expires_at:       computeExpiresAt(tier, timezone).toISOString(),
     })
     .select()
     .single();
@@ -178,4 +284,32 @@ export async function POST(req: NextRequest) {
   }
 
   return NextResponse.json({ quest }, { status: 201 });
+}
+
+// ─── Logging helper ───────────────────────────────────────────────────────────
+
+async function logGeneration(
+  userId:           string,
+  tier:             string,
+  systemPrompt:     string,
+  userMessage:      string,
+  responseJson:     QuestOutput | null,
+  regenerated:      boolean,
+  hardNosTriggered: boolean,
+  error:            string | null,
+) {
+  try {
+    await supabaseAdmin.from("quest_generation_log").insert({
+      user_id:           userId,
+      tier,
+      system_prompt:     systemPrompt,
+      user_message:      userMessage,
+      response_json:     responseJson as unknown as Record<string, unknown>,
+      regenerated,
+      hard_nos_triggered: hardNosTriggered,
+      error,
+    });
+  } catch (err) {
+    console.warn("[generate-quest] logging failed", err);
+  }
 }

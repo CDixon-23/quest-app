@@ -5,25 +5,25 @@ import type { QuestTier } from "@/lib/database.types";
 
 const REALM_LABELS: Record<string, string> = {
   physical_outdoor: "Physical & Outdoor",
-  creative: "Creative",
-  social: "Social",
-  learning: "Learning",
-  mindfulness: "Mindfulness",
-  career: "Career",
-  weird_random: "Weird & Random",
+  creative:         "Creative",
+  social:           "Social",
+  learning:         "Learning",
+  mindfulness:      "Mindfulness",
+  career:           "Career",
+  weird_random:     "Weird & Random",
 };
 
 const ENVIRONMENT_LABELS: Record<string, string> = {
   dense_city: "Dense city",
-  suburb: "Suburb",
+  suburb:     "Suburb",
   small_town: "Small town",
-  rural: "Rural",
+  rural:      "Rural",
 };
 
 const TIME_LABELS: Record<string, string> = {
-  "15min": "15 minutes",
-  "30min": "30 minutes",
-  "1hour": "1 hour",
+  "15min":  "15 minutes",
+  "30min":  "30 minutes",
+  "1hour":  "1 hour",
 };
 
 const DARING_LABELS: Record<number, string> = {
@@ -35,17 +35,17 @@ const DARING_LABELS: Record<number, string> = {
 };
 
 const REWARD_LABELS: Record<string, string> = {
-  learning_something_new: "learning something new",
-  making_something: "making something",
+  learning_something_new:  "learning something new",
+  making_something:        "making something",
   connecting_with_someone: "connecting with someone",
-  pushing_my_limits: "pushing my limits",
-  quiet_wins: "quiet wins",
+  pushing_my_limits:       "pushing my limits",
+  quiet_wins:              "quiet wins",
 };
 
 const TIER_SCOPE: Record<QuestTier, string> = {
   daily:   "a single session of 15–60 minutes — something the adventurer can complete today",
   weekly:  "a multi-step challenge that unfolds across several sessions or requires planning over 3–7 days",
-  monthly: "a significant commitment with real stakes or meaningful skill-building that matures over most of a month",
+  monthly: "a significant commitment with real stakes or meaningful skill-building that matures over a full month",
 };
 
 // ─── XP ranges ───────────────────────────────────────────────────────────────
@@ -56,9 +56,9 @@ export const XP_RANGE: Record<QuestTier, { min: number; max: number }> = {
   monthly: { min: 1500, max: 3000 },
 };
 
-// ─── System prompt ───────────────────────────────────────────────────────────
+// ─── Base system prompt ───────────────────────────────────────────────────────
 
-export const QUEST_SYSTEM_PROMPT = `\
+const BASE_SYSTEM_PROMPT = `\
 You are the Guide — a warm, encouraging mentor who hands adventurers real-world quests \
 the way the Great Deku Tree might nudge a young hero: with wonder, specificity, and \
 absolute confidence that the adventurer is ready for this.
@@ -72,7 +72,7 @@ Every quest you forge must be:
   require multiple sessions or advance planning; monthly quests demand real commitment and \
   leave a lasting mark
 - Grounded in the adventurer's environment — a dense-city quest is different from a rural one
-- Free of anything the adventurer has listed as a hard no — this rule is absolute, no exceptions
+- Free of anything the adventurer has listed as a hard no — this rule is ABSOLUTE, no exceptions
 - Calibrated to their daring level (1 = familiar and cosy, 5 = stretch into genuine discomfort)
 - Rooted in at least one of their declared realms of interest
 - Concrete and specific, never vague — "find the oldest gravestone in the nearest cemetery \
@@ -85,6 +85,37 @@ success_criteria should be unambiguous — a clear, observable finish line the a
 honestly tick off when done.
 
 Tone: like Zelda's wise mentors — gentle authority, genuine warmth, a flicker of magic.`;
+
+/**
+ * Builds the system prompt, optionally injecting hard-nos constraints and
+ * strict-mode instructions for retry attempts.
+ */
+export function buildSystemPrompt(hardNos?: string, strictMode = false): string {
+  let prompt = BASE_SYSTEM_PROMPT;
+
+  if (hardNos?.trim()) {
+    const keywords = hardNos
+      .split(/[,;]+/)
+      .map((k) => k.trim())
+      .filter(Boolean);
+
+    prompt +=
+      `\n\nCRITICAL CONSTRAINT — NON-NEGOTIABLE:\n` +
+      `You MUST NEVER suggest anything that involves the following. ` +
+      `This rule overrides everything else:\n` +
+      keywords.map((k) => `- ${k}`).join("\n") +
+      `\nIf any part of your quest touches these topics, stop immediately and choose ` +
+      `a completely different concept.`;
+  }
+
+  if (strictMode) {
+    prompt +=
+      `\n\nIMPORTANT: Output ONLY the JSON object. ` +
+      `Do not include explanations, preamble, or any text outside the JSON.`;
+  }
+
+  return prompt;
+}
 
 // ─── Profile formatter ───────────────────────────────────────────────────────
 
@@ -115,8 +146,15 @@ export function formatProfile(answers: OnboardingAnswers): string {
 
 // ─── User message builder ────────────────────────────────────────────────────
 
-export function buildUserMessage(tier: QuestTier, answers: OnboardingAnswers): string {
-  return [
+/**
+ * @param recentTitles - Last N quest titles of this tier; passed to encourage diversity.
+ */
+export function buildUserMessage(
+  tier: QuestTier,
+  answers: OnboardingAnswers,
+  recentTitles: string[] = [],
+): string {
+  const parts = [
     `Generate a ${tier.toUpperCase()} quest for the adventurer below.`,
     ``,
     `Tier scope: ${TIER_SCOPE[tier]}`,
@@ -125,28 +163,55 @@ export function buildUserMessage(tier: QuestTier, answers: OnboardingAnswers): s
     `ADVENTURER PROFILE`,
     `──────────────────`,
     formatProfile(answers),
-  ].join("\n");
+  ];
+
+  if (recentTitles.length > 0) {
+    parts.push(
+      ``,
+      `RECENT ${tier.toUpperCase()} QUESTS — avoid repeating or closely resembling these:`,
+      ...recentTitles.map((t) => `- ${t}`),
+    );
+  }
+
+  return parts.join("\n");
 }
 
-// ─── expires_at calculator ───────────────────────────────────────────────────
+// ─── Timezone-aware expires_at calculator ────────────────────────────────────
 
-export function computeExpiresAt(tier: QuestTier): Date {
+/**
+ * Returns the end-of-local-day timestamp for the given IANA timezone.
+ * Handles DST correctly to within ~1 minute.
+ */
+function endOfDayInTimezone(now: Date, timezone: string): Date {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    hour:     "2-digit",
+    minute:   "2-digit",
+    second:   "2-digit",
+    hour12:   false,
+  });
+
+  const parts = fmt.formatToParts(now);
+  const h  = parseInt(parts.find((p) => p.type === "hour")!.value)   % 24;
+  const m  = parseInt(parts.find((p) => p.type === "minute")!.value);
+  const s  = parseInt(parts.find((p) => p.type === "second")!.value);
+  const ms = now.getMilliseconds();
+
+  const msSinceMidnight = (h * 3600 + m * 60 + s) * 1000 + ms;
+  const midnightUTC     = now.getTime() - msSinceMidnight;
+
+  // midnight + 24h − 1ms = last millisecond of today in user's TZ
+  return new Date(midnightUTC + 24 * 60 * 60 * 1000 - 1);
+}
+
+export function computeExpiresAt(tier: QuestTier, timezone = "UTC"): Date {
   const now = new Date();
   switch (tier) {
-    case "daily": {
-      const end = new Date(now);
-      end.setHours(23, 59, 59, 999);
-      return end;
-    }
-    case "weekly": {
-      const end = new Date(now);
-      end.setDate(now.getDate() + 7);
-      end.setHours(23, 59, 59, 999);
-      return end;
-    }
-    case "monthly": {
-      // Last millisecond of the current month
-      return new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
-    }
+    case "daily":
+      return endOfDayInTimezone(now, timezone);
+    case "weekly":
+      return new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    case "monthly":
+      return new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
   }
 }

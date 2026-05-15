@@ -32,58 +32,36 @@ describe("computeExpiresAt", () => {
     vi.useRealTimers();
   });
 
-  it("daily: expires at end of today (23:59:59.999)", () => {
-    const result = computeExpiresAt("daily");
-    expect(result.getHours()).toBe(23);
-    expect(result.getMinutes()).toBe(59);
-    expect(result.getSeconds()).toBe(59);
-    expect(result.getMilliseconds()).toBe(999);
-    // Same calendar day
-    const now = new Date();
-    expect(result.getDate()).toBe(now.getDate());
-    expect(result.getMonth()).toBe(now.getMonth());
-    expect(result.getFullYear()).toBe(now.getFullYear());
+  it("daily: expires at end of today in UTC (23:59:59.999 UTC)", () => {
+    const result = computeExpiresAt("daily", "UTC");
+    expect(result.getUTCHours()).toBe(23);
+    expect(result.getUTCMinutes()).toBe(59);
+    expect(result.getUTCSeconds()).toBe(59);
+    expect(result.getUTCMilliseconds()).toBe(999);
+    // Same UTC calendar day as the pinned time (2026-05-14)
+    expect(result.getUTCDate()).toBe(14);
+    expect(result.getUTCMonth()).toBe(4); // May (0-indexed)
+    expect(result.getUTCFullYear()).toBe(2026);
   });
 
-  it("weekly: expires 7 days from now at 23:59:59.999", () => {
+  it("weekly: expires approximately 7 days from now", () => {
+    const now    = Date.now();
     const result = computeExpiresAt("weekly");
-    const expected = new Date("2026-05-14T10:00:00.000Z");
-    expected.setDate(expected.getDate() + 7);
-    expect(result.getDate()).toBe(expected.getDate());
-    expect(result.getMonth()).toBe(expected.getMonth());
-    expect(result.getHours()).toBe(23);
-    expect(result.getMinutes()).toBe(59);
-    expect(result.getSeconds()).toBe(59);
-    expect(result.getMilliseconds()).toBe(999);
+    const diff   = result.getTime() - now;
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    // Allow ±1 second tolerance
+    expect(diff).toBeGreaterThanOrEqual(sevenDaysMs - 1000);
+    expect(diff).toBeLessThanOrEqual(sevenDaysMs + 1000);
   });
 
-  it("monthly: expires on the last day of the current month at 23:59:59.999", () => {
+  it("monthly: expires approximately 30 days from now", () => {
+    const now    = Date.now();
     const result = computeExpiresAt("monthly");
-    // May 2026 has 31 days
-    expect(result.getMonth()).toBe(4); // May (0-indexed)
-    expect(result.getDate()).toBe(31);
-    expect(result.getHours()).toBe(23);
-    expect(result.getSeconds()).toBe(59);
-    expect(result.getMilliseconds()).toBe(999);
-  });
-
-  it("monthly: handles months with 30 days (April)", () => {
-    vi.setSystemTime(new Date("2026-04-01T08:00:00.000Z"));
-    const result = computeExpiresAt("monthly");
-    expect(result.getMonth()).toBe(3); // April
-    expect(result.getDate()).toBe(30);
-  });
-
-  it("monthly: handles February in a leap year", () => {
-    vi.setSystemTime(new Date("2028-02-10T08:00:00.000Z"));
-    const result = computeExpiresAt("monthly");
-    expect(result.getDate()).toBe(29); // 2028 is a leap year
-  });
-
-  it("monthly: handles February in a non-leap year", () => {
-    vi.setSystemTime(new Date("2026-02-10T08:00:00.000Z"));
-    const result = computeExpiresAt("monthly");
-    expect(result.getDate()).toBe(28);
+    const diff   = result.getTime() - now;
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    // Allow ±1 second tolerance
+    expect(diff).toBeGreaterThanOrEqual(thirtyDaysMs - 1000);
+    expect(diff).toBeLessThanOrEqual(thirtyDaysMs + 1000);
   });
 
   it("daily expires before weekly which expires before monthly", () => {
